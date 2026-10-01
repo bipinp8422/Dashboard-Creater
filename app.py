@@ -9,8 +9,10 @@ plus a combined "All regions" mail when more than one region is uploaded.
 Run:  streamlit run app.py
 """
 
+import base64
 import calendar
 import hashlib
+import io
 import html as htmllib
 import json
 import re
@@ -19,7 +21,12 @@ from collections import Counter
 from datetime import date
 from email.message import EmailMessage
 
-import streamlit as st
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+from matplotlib.patches import Patch  # noqa: E402
+import streamlit as st  # noqa: E402
 import streamlit.components.v1 as components
 
 # --------------------------------------------------------------------------
@@ -154,12 +161,215 @@ def build_summary(d: dict, region: str) -> dict:
         "reported": reported,
         "untapped": untapped,
         "weekday": weekday_stats(daily),
+        "daily": daily,
+        "target_line": rd.get("dailyTargetLine", 0),
+        "all_reps": reps_sorted,
+        "cats_all": cats,
     }
 
 
 # --------------------------------------------------------------------------
 # Mail writers
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Snapshots (charts embedded in the mail)
+# --------------------------------------------------------------------------
+GREEN_C, RED_C, NAVY_C = "#1b7f3b", "#c0392b", "#0b3d91"
+REGION_COLORS = ["#0b3d91", "#e07b00", "#1b7f3b", "#7b3fa0", "#c0392b", "#0e8f9c"]
+SNAP_CAPTIONS = {
+    "daily": "Daily revenue vs the pace needed to hit target",
+    "reps": "Target achievement by rep",
+    "mix": "Product mix and tier attainment",
+    "regions": "Target vs achieved by region",
+    "daily_regions": "Daily revenue by region vs daily pace needed",
+}
+SNAP_LABELS = {
+    "daily": "Daily revenue vs target pace",
+    "reps": "Rep-wise achievement %",
+    "mix": "Product mix & tier attainment",
+    "regions": "Region comparison (All-regions mail)",
+    "daily_regions": "Daily revenue by region (All-regions mail)",
+}
+REGION_SNAPS = ("daily", "reps", "mix")
+COMBINED_SNAPS = ("regions", "daily_regions")
+SNAP_RE = re.compile(r"^\[\[SNAPSHOT:(\w+)\]\]$")
+
+
+def _png(fig):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=170, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def _style(ax):
+    for sp in ("top", "right"):
+        ax.spines[sp].set_visible(False)
+    for sp in ("left", "bottom"):
+        ax.spines[sp].set_color("#cfd6e0")
+    ax.tick_params(colors="#374151", labelsize=8)
+    ax.set_axisbelow(True)
+
+
+def _title(ax, text):
+    ax.set_title(text, fontsize=10, fontweight="bold", loc="left", color=NAVY_C)
+
+
+def chart_daily(s):
+    days = [date.fromisoformat(d["DateStr"]).day for d in s["daily"]]
+    rev = [d["Revenue"] / 1e5 for d in s["daily"]]
+    tl = s["target_line"] / 1e5
+    fig, ax = plt.subplots(figsize=(7.2, 3.2))
+    _style(ax)
+    ax.bar(days, rev, color=[GREEN_C if r >= tl else RED_C for r in rev], width=0.75)
+    ax.axhline(tl, ls="--", color=NAVY_C, lw=1.2)
+    ax.set_xticks(days)
+    ax.tick_params(axis="x", labelsize=7)
+    ax.set_ylabel("Revenue (₹ Lakh)", fontsize=8)
+    ax.grid(axis="y", color="#e5e7eb", lw=0.6)
+    _title(ax, f"{s['region']} – daily revenue vs required pace (₹{tl:.1f} L/day)")
+    ax.legend(handles=[Patch(color=GREEN_C, label="Above daily pace"), Patch(color=RED_C, label="Below daily pace"),
+                       plt.Line2D([0], [0], ls="--", color=NAVY_C, label="Daily pace needed")],
+              fontsize=7, frameon=False, loc="upper center", bbox_to_anchor=(0.5, -0.1), ncol=3)
+    return _png(fig)
+
+
+def chart_reps(s):
+    reps = s["all_reps"]
+    if not reps:
+        return None
+    if len(reps) > 24:
+        reps = reps[:12] + reps[-12:]
+    reps = reps[::-1]  # best performer ends up on top
+    names = [f"{r['Name'].title()} ({r['City']})" for r in reps]
+    vals = [r["AchPct"] for r in reps]
+    mx = max(vals)
+    cap = 300 if mx > 300 else mx * 1.15
+    fig, ax = plt.subplots(figsize=(7.2, max(2.6, 0.27 * len(reps) + 1)))
+    _style(ax)
+    ax.barh(names, [min(v, cap) for v in vals], color=[GREEN_C if v >= 100 else RED_C for v in vals], height=0.7)
+    ax.axvline(100, ls="--", color=NAVY_C, lw=1.1)
+    ax.set_xlim(0, cap * 1.12)
+    for i, v in enumerate(vals):
+        if v > cap:
+            ax.text(cap - 2, i, f"{v:.0f}%", ha="right", va="center", color="white", fontsize=7, fontweight="bold")
+        else:
+            ax.text(v + cap * 0.01, i, f"{v:.0f}%", va="center", fontsize=7)
+    ax.tick_params(axis="y", labelsize=7)
+    ax.set_xlabel("Achievement % (dashed line = 100% of target)", fontsize=8)
+    _title(ax, f"{s['region']} – target achievement by rep")
+    return _png(fig)
+
+
+def chart_mix(s):
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(7.2, 3.1), gridspec_kw={"width_ratios": [1.5, 1]})
+    cats = s["cats_all"][:6][::-1]
+    for a in (a1, a2):
+        _style(a)
+    if cats:
+        vals = [c["Revenue"] / 1e7 for c in cats]
+        a1.barh([c["Product Category"] for c in cats], vals, color=NAVY_C, height=0.65)
+        for i, (c, v) in enumerate(zip(cats, vals)):
+            a1.text(v * 1.02, i, f"₹{v:.2f} Cr ({c['Revenue'] / s['total_rev'] * 100:.0f}%)", va="center", fontsize=7)
+        a1.set_xlim(0, max(vals) * 1.6)
+    _title(a1, "Revenue by product (₹ Cr)")
+    a1.tick_params(axis="y", labelsize=8)
+    tiers = s["tiers"]
+    if tiers:
+        t_vals = [t["AchPct"] for t in tiers]
+        a2.bar([t["Tier"] for t in tiers], t_vals, color=[GREEN_C if v >= 100 else RED_C for v in t_vals], width=0.6)
+        a2.axhline(100, ls="--", color=NAVY_C, lw=1.1)
+        for i, v in enumerate(t_vals):
+            a2.text(i, v + max(t_vals) * 0.02, f"{v:.0f}%", ha="center", fontsize=8, fontweight="bold")
+        a2.set_ylim(0, max(t_vals) * 1.18)
+    else:
+        a2.axis("off")
+    _title(a2, "Attainment by tier")
+    fig.tight_layout()
+    return _png(fig)
+
+
+def chart_regions(sums):
+    fig, ax = plt.subplots(figsize=(7.2, 3.1))
+    _style(ax)
+    x = range(len(sums))
+    w = 0.36
+    ax.bar([i - w / 2 for i in x], [r["target"] / 1e7 for r in sums], w, color="#a9bde0", label="Target")
+    ax.bar([i + w / 2 for i in x], [r["achieved"] / 1e7 for r in sums], w, color=NAVY_C, label="Achieved")
+    top = max(r["achieved"] / 1e7 for r in sums)
+    for i, r in enumerate(sums):
+        ax.text(i + w / 2, r["achieved"] / 1e7 + top * 0.02, f"{r['ach_pct']:.0f}%", ha="center", fontsize=9,
+                fontweight="bold", color=GREEN_C if r["ach_pct"] >= 100 else RED_C)
+    ax.set_xticks(list(x))
+    ax.set_xticklabels([r["region"] for r in sums])
+    ax.set_ylabel("₹ Crore", fontsize=8)
+    ax.set_ylim(0, top * 1.18)
+    ax.grid(axis="y", color="#e5e7eb", lw=0.6)
+    ax.legend(fontsize=8, frameon=False)
+    _title(ax, "Target vs achieved by region")
+    return _png(fig)
+
+
+def chart_daily_regions(sums):
+    fig, ax = plt.subplots(figsize=(7.2, 3.2))
+    _style(ax)
+    for i, r in enumerate(sums):
+        col = REGION_COLORS[i % len(REGION_COLORS)]
+        days = [date.fromisoformat(d["DateStr"]).day for d in r["daily"]]
+        ax.plot(days, [d["Revenue"] / 1e5 for d in r["daily"]], color=col, lw=1.6, marker="o", ms=2.5, label=r["region"])
+        ax.axhline(r["target_line"] / 1e5, color=col, ls=":", lw=1)
+    ax.set_ylabel("Revenue (₹ Lakh)", fontsize=8)
+    ax.set_xlabel("Day of month  (dotted line = daily pace needed)", fontsize=8)
+    ax.grid(axis="y", color="#e5e7eb", lw=0.6)
+    ax.legend(fontsize=8, frameon=False, ncol=len(sums))
+    _title(ax, "Daily revenue by region")
+    return _png(fig)
+
+
+REGION_CHARTS = {"daily": chart_daily, "reps": chart_reps, "mix": chart_mix}
+COMBINED_CHARTS = {"regions": chart_regions, "daily_regions": chart_daily_regions}
+
+
+@st.cache_data(show_spinner=False)
+def charts_for_region(summary_json, keys):
+    s = json.loads(summary_json)
+    return {k: img for k in keys if (img := REGION_CHARTS[k](s))}
+
+
+@st.cache_data(show_spinner=False)
+def charts_for_combined(summaries_json, keys):
+    sums = json.loads(summaries_json)
+    return {k: img for k in keys if (img := COMBINED_CHARTS[k](sums))}
+
+
+def snap_lines(cfg, combined=False):
+    allowed = COMBINED_SNAPS if combined else REGION_SNAPS
+    keys = [k for k in cfg.get("snapshots", []) if k in allowed]
+    if not keys:
+        return []
+    return ["", "SNAPSHOTS"] + [f"[[SNAPSHOT:{k}]]" for k in keys]
+
+
+def manual_lines(cfg, internal=False):
+    if not cfg.get("manual"):
+        return []
+    if internal:
+        return ["", "HOW TO READ THE DASHBOARD",
+                "1. Open the attached HTML file in Chrome or Edge – no login is needed and all data is inside the file.",
+                "2. Use the Region buttons and the BM, State Head and City drop-downs at the top to see your own numbers; every chart and table follows these filters.",
+                "3. In Day Explorer, click any day's bar for a full breakdown. Bars are colour-coded as above or below the daily pace needed to hit target.",
+                "4. Check Top 10 Performers and Needs Attention (Bottom 10) for your ranking, and Rep Counter & Revenue Coverage for TPS partners reporting under each rep.",
+                "5. Use the Model-wise table for units and revenue by model, and the search box in Revenue Pivot to find any partner quickly."]
+    return ["", "HOW TO USE THE DASHBOARD",
+            "1. Save the attached HTML file and open it in Chrome or Edge (double-click). No login or installation is needed – all data is inside the file.",
+            "2. Use the Region buttons at the top and the BM, State Head and City drop-downs to filter; every KPI, chart and table updates with them.",
+            "3. Start with the KPI cards and the Executive Summary for the month at a glance – the summary is auto-generated and follows the region filter.",
+            "4. In Day Explorer, click any day's bar to see that day's breakdown. Bars are colour-coded as above or below the daily pace needed to hit target.",
+            "5. Top 10 Performers and Needs Attention (Bottom 10) show who is leading and who needs support; Achievement Distribution groups reps by performance slab.",
+            "6. The Alpha / X Factor section shows program revenue and the Ink vs Laser split; the Model-wise table gives units and revenue by model.",
+            "7. Rep Counter & Revenue Coverage shows TPS partners reporting under each rep, and Revenue Pivot has a search box to find any partner or rep."]
+
+
 def signature(cfg):
     lines = ["Warm regards," if cfg["audience"] == "Client / leadership" else "Regards,", cfg["sender"] or "[Your Name]"]
     desig = f"{cfg['designation']} | {cfg['company']}" if cfg["designation"] else cfg["company"]
@@ -246,6 +456,7 @@ def client_mail(s, cfg):
     if s["top_reps"]:
         L.append("• Top performers: " + join_list(f"{r['Name']} ({r['City']}, {pct(r['AchPct'])})" for r in s["top_reps"][:3]) + ".")
 
+    L += snap_lines(cfg)
     L += ["", f"AREAS OF FOCUS FOR {cfg['next_month'].upper()}"]
     if s["below"]:
         L.append(f"• {len(s['below'])} rep{'s' if len(s['below']) > 1 else ''} remain below target "
@@ -262,6 +473,7 @@ def client_mail(s, cfg):
         extra = f", particularly in {s['weak_type']}" if s["weak_type"] else ""
         L.append(f"• Scale Alpha / X-Factor tagging further{extra}.")
 
+    L += manual_lines(cfg)
     L += ["", f"We would value 30 minutes to walk you through the dashboard and align on the {cfg['next_month']} plan "
               "and any support needed from the Canon side.", "", "Thank you for your continued partnership.", "",
           signature(cfg), "",
@@ -294,6 +506,7 @@ def internal_mail(s, cfg):
         best = max(s["tiers"], key=lambda t: t["AchPct"])
         L.append(f"• {best['Tier']} locations delivered the best attainment at {pct(best['AchPct'])}")
 
+    L += snap_lines(cfg)
     L += ["", "WHERE WE CAN DO BETTER"]
     if s["below"]:
         L.append("• A few reps are still below target: " + below_text(s, True).replace("(", "– ").replace(")", "")
@@ -313,6 +526,7 @@ def internal_mail(s, cfg):
     L.append(f"{n}. Each rep to list 10 non-reporting counters to activate in the first week of {cfg['next_month']}.")
     n += 1
     L.append(f"{n}. Review call on {cfg['review_call'] or '[date/time]'} using the attached dashboard.")
+    L += manual_lines(cfg, internal=True)
     L += ["", "The dashboard is attached – please check your own numbers by city and model.", "",
           f"Let's make {cfg['next_month']} even bigger!", "", signature(cfg)]
     return "\n".join(L)
@@ -348,6 +562,7 @@ def combined_mail(summaries, cfg):
         L += ["", "TOP PERFORMERS"]
         for r in all_top:
             L.append(f"• {r['Name']} ({r['City']}, {r['Region']}) – {pct(r['AchPct'])} | {money(r['RevenueAchieved'])}")
+    L += snap_lines(cfg, combined=True)
     L += ["", f"AREAS OF FOCUS FOR {cfg['next_month'].upper()}"]
     if all_below:
         L.append("• Reps below target: " + ", ".join(f"{r['Name'] if not client else r['City']} ({r['Region']}) {pct(r['AchPct'])}" for r in all_below)
@@ -359,6 +574,7 @@ def combined_mail(summaries, cfg):
     for s in ranked:
         if s["ach_pct"] < 100:
             L.append(f"• {s['region']} is {money(s['target'] - s['achieved'])} short of target and will get extra review attention.")
+    L += manual_lines(cfg)
     L += ["", "We would value 30 minutes to walk through the dashboards and align on the next-month plan." if client
           else f"Let's keep the momentum going into {cfg['next_month']}.", "", signature(cfg)]
     return "\n".join(L)
@@ -418,7 +634,7 @@ def _snapshot_table(rows):
             + "".join(f'<th style="{TH}">{h}</th>' for h in heads) + f"</tr>{body}</table>")
 
 
-def to_html(body, kpi=None, snapshot=None):
+def to_html(body, kpi=None, snapshot=None, images=None, embed="data"):
     """Convert the plain-text mail into a clean, email-safe HTML body (Calibri, simple tables)."""
     lines = body.split("\n")
     out, mode, cards_done, skip_bullets, i = [], None, kpi is None, False, 0
@@ -442,6 +658,18 @@ def to_html(body, kpi=None, snapshot=None):
         if not line.strip():
             close()
             skip_bullets = False
+            continue
+        msnap = SNAP_RE.match(line.strip())
+        if msnap:
+            close()
+            key = msnap.group(1)
+            if images and key in images:
+                src = (f"cid:snap_{key}" if embed == "cid"
+                       else "data:image/png;base64," + base64.b64encode(images[key]).decode())
+                cap = htmllib.escape(SNAP_CAPTIONS.get(key, key))
+                out.append(f'<p style="margin:10px 0 4px;"><img src="{src}" alt="{cap}" width="640" '
+                           f'style="max-width:100%;height:auto;border:1px solid #d5dbe5;"><br>'
+                           f'<span style="font-size:9pt;color:#555555;">Snapshot: {cap}</span></p>')
             continue
         if line.startswith(("Warm regards,", "Regards,")):
             close()
@@ -484,7 +712,7 @@ def to_html(body, kpi=None, snapshot=None):
 # --------------------------------------------------------------------------
 # Output helpers
 # --------------------------------------------------------------------------
-def make_eml(subject, plain, html_body, to="", cc="", sender=""):
+def make_eml(subject, plain, html_body, to="", cc="", sender="", images=None):
     msg = EmailMessage()
     if sender:
         msg["From"] = sender
@@ -496,6 +724,10 @@ def make_eml(subject, plain, html_body, to="", cc="", sender=""):
     msg["X-Unsent"] = "1"  # opens as an editable draft in Outlook
     msg.set_content(plain)
     msg.add_alternative(f'<html><head><meta charset="utf-8"></head><body>{html_body}</body></html>', subtype="html")
+    if images:
+        html_part = msg.get_payload()[1]
+        for key, data in images.items():
+            html_part.add_related(data, "image", "png", cid=f"<snap_{key}>", filename=f"{key}.png")
     return msg.as_bytes()
 
 
@@ -538,24 +770,34 @@ def preview_component(html_body, subject, to, cc, sender, attach_note):
     components.html(page, height=1050, scrolling=True)
 
 
-def render_mail_block(key, subject, body, cfg, kpi=None, snapshot=None):
+def plain_text(text):
+    """Plain-text version of the mail: chart markers become a short note."""
+    return re.sub(r"^\[\[SNAPSHOT:(\w+)\]\]$", lambda m: f"[Chart: {SNAP_CAPTIONS.get(m.group(1), m.group(1))}]",
+                  text, flags=re.M)
+
+
+def render_mail_block(key, subject, body, cfg, kpi=None, snapshot=None, images=None):
     ident = hashlib.md5((subject + body).encode()).hexdigest()[:8]  # reset widgets when settings change
     tab_fmt, tab_edit = st.tabs(["📧 Mail preview", "✏️ Edit text"])
     with tab_edit:
         subj = st.text_input("Subject", subject, key=f"subj_{key}_{ident}")
-        text = st.text_area("Mail text (edits update the preview)", body, height=520, key=f"body_{key}_{ident}")
-    html_body = to_html(text, kpi, snapshot)
+        text = st.text_area("Mail text (edits update the preview)", body, height=560, key=f"body_{key}_{ident}")
+        st.caption("Lines like [[SNAPSHOT:daily]] insert a chart image – delete the line to remove that chart.")
+    html_body = to_html(text, kpi, snapshot, images, "data")
+    html_cid = to_html(text, kpi, snapshot, images, "cid")
     sender = f"{cfg['sender']} <{cfg['email']}>" if cfg["sender"] and cfg["email"] else (cfg["email"] or cfg["sender"])
     attach = re.search(r"^Attachment: (.*)$", text, re.M)
     with tab_fmt:
         preview_component(html_body, subj, cfg["to"], cfg["cc"], sender, attach.group(1) if attach else "")
         c1, c2, c3 = st.columns(3)
         safe = re.sub(r"[^A-Za-z0-9_-]+", "_", key)
-        c1.download_button("⬇️ Download .eml (open in Outlook)", make_eml(subj, text, html_body, cfg["to"], cfg["cc"], sender),
+        used = {k: v for k, v in (images or {}).items() if f"[[SNAPSHOT:{k}]]" in text}
+        c1.download_button("⬇️ Download .eml (best – charts embedded)",
+                           make_eml(subj, plain_text(text), html_cid, cfg["to"], cfg["cc"], sender, used),
                            f"{safe}.eml", "message/rfc822", use_container_width=True, key=f"eml_{key}_{ident}")
         c2.download_button("⬇️ Download .html", f'<html><head><meta charset="utf-8"></head><body>{html_body}</body></html>',
                            f"{safe}.html", "text/html", use_container_width=True, key=f"html_{key}_{ident}")
-        c3.download_button("⬇️ Download plain .txt", f"Subject: {subj}\n\n{text}", f"{safe}.txt",
+        c3.download_button("⬇️ Download plain .txt", f"Subject: {subj}\n\n{plain_text(text)}", f"{safe}.txt",
                            use_container_width=True, key=f"txt_{key}_{ident}")
 
 
@@ -585,6 +827,10 @@ def main():
         to = st.text_input("To (email addresses)", "")
         cc = st.text_input("Cc (email addresses)", "")
         next_month = st.text_input("Next month label", "October")
+        st.subheader("Mail content")
+        snapshots = st.multiselect("Snapshots (charts) to include", list(SNAP_LABELS), default=list(SNAP_LABELS),
+                                   format_func=lambda k: SNAP_LABELS[k])
+        manual = st.checkbox("Include 'How to use the dashboard' guide", value=True)
         st.subheader("Signature")
         sender = st.text_input("Your name", "")
         designation = st.text_input("Designation", "")
@@ -596,7 +842,7 @@ def main():
             deadline = st.text_input("Recovery-plan deadline", "")
             review_call = st.text_input("Review call date/time", "")
 
-    cfg = dict(to=to, cc=cc, audience=audience, company=company, program=program, recipient=recipient, next_month=next_month,
+    cfg = dict(snapshots=snapshots, manual=manual, to=to, cc=cc, audience=audience, company=company, program=program, recipient=recipient, next_month=next_month,
                sender=sender, designation=designation, phone=phone, email=email, deadline=deadline, review_call=review_call)
 
     files = st.file_uploader("Upload dashboard HTML file(s)", type=["html", "htm"], accept_multiple_files=True)
@@ -630,7 +876,8 @@ def main():
     for tab, s in zip(tabs, ordered):
         with tab:
             kpi_row(s)
-            render_mail_block(f"{s['region']}_{audience[:3]}", subject_for(s, cfg), build_mail(s, cfg), cfg, kpi=s)
+            imgs = charts_for_region(json.dumps(s, default=str), tuple(k for k in snapshots if k in REGION_SNAPS))
+            render_mail_block(f"{s['region']}_{audience[:3]}", subject_for(s, cfg), build_mail(s, cfg), cfg, kpi=s, images=imgs)
 
     if len(ordered) > 1:
         with tabs[-1]:
@@ -642,7 +889,8 @@ def main():
             period = ordered[0]["period"]
             subj = (f"{short(cfg)} × {cfg['program']} | All Regions – {period} Performance: {pct(tot_a / tot_t * 100)} Target Achievement"
                     if audience.startswith("Client") else f"{period} Results – All Regions at {pct(tot_a / tot_t * 100)} of Target")
-            render_mail_block(f"All_{audience[:3]}", subj, combined_mail(ordered, cfg), cfg, kpi=tot, snapshot=sorted(ordered, key=lambda x: x['ach_pct'], reverse=True))
+            imgs = charts_for_combined(json.dumps(ordered, default=str), tuple(k for k in snapshots if k in COMBINED_SNAPS))
+            render_mail_block(f"All_{audience[:3]}", subj, combined_mail(ordered, cfg), cfg, kpi=tot, snapshot=sorted(ordered, key=lambda x: x['ach_pct'], reverse=True), images=imgs)
 
     st.caption("Numbers come straight from the uploaded dashboards. Please review the mail and add your own context before sending.")
 
