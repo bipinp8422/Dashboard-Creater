@@ -390,23 +390,38 @@ def _bullet(text):
     return _inline(text)
 
 
-def _kpi_cards(k):
+TH = f"background:{NAVY};color:#ffffff;padding:6px 10px;border:1px solid {NAVY};font-weight:bold;text-align:center;"
+TD = "padding:6px 10px;border:1px solid #bfc7d5;text-align:center;"
+
+
+def _kpi_table(k):
     ach = k["ach_pct"]
     colour = GREEN if ach >= 100 else AMBER if ach >= 80 else RED
-    cells = [("Target", money(k["target"]), NAVY), ("Achieved", money(k["achieved"]), NAVY),
-             ("Attainment", pct(ach), colour), ("Reps ≥ 100%", f"{k['above_n']} / {k['reps_n']}", NAVY)]
-    tds = "".join(
-        f'<td align="center" width="25%" style="border:1px solid #d5dbe5;background:#f7f9fc;padding:10px 6px;">'
-        f'<div style="font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:.5px;">{lab}</div>'
-        f'<div style="font-size:21px;font-weight:bold;color:{col};padding-top:3px;">{val}</div></td>'
-        for lab, val, col in cells)
-    return f'<table width="100%" cellpadding="0" cellspacing="6" style="border-collapse:separate;margin:10px 0 4px;"><tr>{tds}</tr></table>'
+    heads = ["Target", "Achieved", "Attainment", "Reps ≥ 100%"]
+    vals = [money(k["target"]), money(k["achieved"]), f'<b style="color:{colour};">{pct(ach)}</b>',
+            f"{k['above_n']} of {k['reps_n']}"]
+    return ('<table cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin:8px 0 6px;min-width:520px;"><tr>'
+            + "".join(f'<th style="{TH}">{h}</th>' for h in heads) + "</tr><tr>"
+            + "".join(f'<td style="{TD}">{v}</td>' for v in vals) + "</tr></table>")
 
 
-def to_html(body, title, kpi=None):
-    """Convert the plain-text mail into an email-safe, inline-styled HTML mail."""
+def _snapshot_table(rows):
+    heads = ["Region", "Target", "Achieved", "Attainment", "Reps ≥ 100%"]
+    body = ""
+    for s in rows:
+        colour = GREEN if s["ach_pct"] >= 100 else AMBER if s["ach_pct"] >= 80 else RED
+        body += ("<tr>" + f'<td style="{TD}text-align:left;"><b>{htmllib.escape(s["region"])}</b></td>'
+                 f'<td style="{TD}">{money(s["target"])}</td><td style="{TD}">{money(s["achieved"])}</td>'
+                 f'<td style="{TD}"><b style="color:{colour};">{pct(s["ach_pct"])}</b></td>'
+                 f'<td style="{TD}">{s["above_n"]} of {s["reps_n"]}</td></tr>')
+    return ('<table cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin:8px 0 6px;min-width:520px;"><tr>'
+            + "".join(f'<th style="{TH}">{h}</th>' for h in heads) + f"</tr>{body}</table>")
+
+
+def to_html(body, kpi=None, snapshot=None):
+    """Convert the plain-text mail into a clean, email-safe HTML body (Calibri, simple tables)."""
     lines = body.split("\n")
-    out, mode, cards_done, i = [], None, kpi is None, 0
+    out, mode, cards_done, skip_bullets, i = [], None, kpi is None, False, 0
 
     def close():
         nonlocal mode
@@ -418,7 +433,7 @@ def to_html(body, title, kpi=None):
         nonlocal mode
         if mode != tag:
             close()
-            out.append(f'<{tag} style="margin:4px 0 8px 0;padding-left:22px;line-height:1.55;">')
+            out.append(f'<{tag} style="margin:4px 0 8px 0;padding-left:24px;">')
             mode = tag
 
     while i < len(lines):
@@ -426,6 +441,7 @@ def to_html(body, title, kpi=None):
         i += 1
         if not line.strip():
             close()
+            skip_bullets = False
             continue
         if line.startswith(("Warm regards,", "Regards,")):
             close()
@@ -434,21 +450,24 @@ def to_html(body, title, kpi=None):
                 block.append(lines[i].strip())
                 i += 1
             rest = "<br>".join(htmllib.escape(b) for b in block[2:])
-            out.append(f'<p style="margin:18px 0 0;">{htmllib.escape(block[0])}<br>'
-                       f'<b style="color:{NAVY};">{htmllib.escape(block[1]) if len(block) > 1 else ""}</b><br>'
-                       f'<span style="color:#4b5563;">{rest}</span></p>')
+            out.append(f'<p style="margin:16px 0 0;">{htmllib.escape(block[0])}<br><br>'
+                       f'<b>{htmllib.escape(block[1]) if len(block) > 1 else ""}</b><br>{rest}</p>')
         elif line.startswith("Attachment:"):
             close()
-            out.append(f'<p style="margin:14px 0 0;padding-top:8px;border-top:1px solid #e5e7eb;font-size:12px;color:#6b7280;">'
-                       f'📎 {htmllib.escape(line)}</p>')
+            out.append(f'<p style="margin:14px 0 0;font-size:10pt;color:#555555;">📎 {htmllib.escape(line)}</p>')
         elif HEADING_RE.match(line):
             close()
             if not cards_done:
-                out.append(_kpi_cards(kpi))
+                out.append(_kpi_table(kpi))
                 cards_done = True
-            out.append(f'<p style="margin:18px 0 6px;padding:5px 10px;border-left:4px solid {NAVY};background:#eef3fb;'
-                       f'color:{NAVY};font-weight:bold;font-size:13px;letter-spacing:.6px;">{htmllib.escape(line)}</p>')
+            out.append(f'<p style="margin:16px 0 4px;padding-bottom:2px;border-bottom:1px solid {NAVY};'
+                       f'color:{NAVY};font-weight:bold;font-size:10.5pt;">{htmllib.escape(line)}</p>')
+            if line == "REGION SNAPSHOT" and snapshot:
+                out.append(_snapshot_table(snapshot))
+                skip_bullets = True
         elif line.startswith("• "):
+            if skip_bullets or (kpi is not None and line.startswith("• Target: ")):
+                continue  # already shown in the summary table
             open_list("ul")
             out.append(f'<li style="margin-bottom:3px;">{_bullet(line[2:])}</li>')
         elif re.match(r"^\d+\. ", line):
@@ -456,20 +475,23 @@ def to_html(body, title, kpi=None):
             out.append(f'<li style="margin-bottom:3px;">{_inline(re.sub(r"^\d+\. ", "", line))}</li>')
         else:
             close()
-            out.append(f'<p style="margin:8px 0;line-height:1.55;">{_inline(line)}</p>')
+            out.append(f'<p style="margin:8px 0;">{_inline(line)}</p>')
     close()
-    banner = (f'<table width="100%" cellpadding="0" cellspacing="0"><tr><td bgcolor="{NAVY}" '
-              f'style="background:{NAVY};color:#ffffff;padding:14px 18px;font-size:16px;font-weight:bold;">'
-              f'{htmllib.escape(title)}</td></tr></table>')
-    return (f'<div style="font-family:{FONT};font-size:14px;color:#1f2937;max-width:720px;'
-            f'border:1px solid #d5dbe5;">{banner}<div style="padding:6px 20px 18px;">{"".join(out)}</div></div>')
+    return (f'<div style="font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000000;line-height:1.5;">'
+            f'{"".join(out)}</div>')
 
 
 # --------------------------------------------------------------------------
 # Output helpers
 # --------------------------------------------------------------------------
-def make_eml(subject, plain, html_body):
+def make_eml(subject, plain, html_body, to="", cc="", sender=""):
     msg = EmailMessage()
+    if sender:
+        msg["From"] = sender
+    if to:
+        msg["To"] = to
+    if cc:
+        msg["Cc"] = cc
     msg["Subject"] = subject
     msg["X-Unsent"] = "1"  # opens as an editable draft in Outlook
     msg.set_content(plain)
@@ -477,13 +499,25 @@ def make_eml(subject, plain, html_body):
     return msg.as_bytes()
 
 
-def preview_component(html_body):
-    """Rendered mail preview with a one-click 'copy formatted' button (paste into Outlook / Gmail)."""
+def preview_component(html_body, subject, to, cc, sender, attach_note):
+    """Mail-window style preview (From / To / Cc / Subject) with a one-click 'copy formatted body' button."""
+    def row(label, value):
+        return (f'<tr><td style="color:#6b7280;padding:3px 10px 3px 0;white-space:nowrap;vertical-align:top;">{label}</td>'
+                f'<td style="padding:3px 0;">{htmllib.escape(value) if value else "<span style=\'color:#9ca3af\'>—</span>"}</td></tr>')
+    header = ('<table style="font:14px Calibri,Arial,sans-serif;width:100%;border-collapse:collapse;">'
+              + row("From", sender) + row("To", to) + row("Cc", cc)
+              + f'<tr><td style="color:#6b7280;padding:3px 10px 3px 0;">Subject</td><td style="padding:3px 0;"><b>{htmllib.escape(subject)}</b></td></tr>'
+              + row("Attachment", attach_note) + "</table>")
     page = """
-    <button id="cp" style="font:600 14px Arial;padding:8px 16px;margin-bottom:10px;border:0;border-radius:6px;
-      background:#0b3d91;color:#fff;cursor:pointer;">📋 Copy formatted mail</button>
-    <span id="msg" style="font:13px Arial;margin-left:10px;color:#1b7f3b;"></span>
-    <div id="mail" style="background:#fff;">__HTML__</div>
+    <div style="font-family:Arial;margin-bottom:8px;">
+      <button id="cp" style="font:600 14px Arial;padding:8px 16px;border:0;border-radius:6px;background:#0b3d91;color:#fff;cursor:pointer;">
+        📋 Copy mail body (formatted)</button>
+      <span id="msg" style="font:13px Arial;margin-left:10px;color:#1b7f3b;"></span>
+    </div>
+    <div style="border:1px solid #cfd6e0;border-radius:6px;background:#fff;">
+      <div style="background:#f3f4f6;padding:10px 16px;border-bottom:1px solid #cfd6e0;border-radius:6px 6px 0 0;">__HEADER__</div>
+      <div id="mail" style="padding:14px 18px;">__HTML__</div>
+    </div>
     <script>
     const msg = document.getElementById('msg');
     document.getElementById('cp').onclick = async () => {
@@ -492,35 +526,35 @@ def preview_component(html_body):
         await navigator.clipboard.write([new ClipboardItem({
           'text/html': new Blob([el.innerHTML], {type: 'text/html'}),
           'text/plain': new Blob([el.innerText], {type: 'text/plain'})})]);
-        msg.textContent = 'Copied! Paste it into your mail body (Ctrl+V).';
+        msg.textContent = 'Copied! Paste into the body of your mail (Ctrl+V).';
       } catch (e) {
         const r = document.createRange(); r.selectNodeContents(el);
         const s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
-        msg.textContent = document.execCommand('copy') ? 'Copied! Paste it into your mail body (Ctrl+V).'
-                          : 'Press Ctrl+C to copy the selected mail.';
+        msg.textContent = document.execCommand('copy') ? 'Copied! Paste into the body of your mail (Ctrl+V).'
+                          : 'Press Ctrl+C to copy the selected text.';
       }
     };
-    </script>""".replace("__HTML__", html_body)
-    components.html(page, height=1000, scrolling=True)
+    </script>""".replace("__HEADER__", header).replace("__HTML__", html_body)
+    components.html(page, height=1050, scrolling=True)
 
 
-def render_mail_block(key, subject, body, kpi=None):
+def render_mail_block(key, subject, body, cfg, kpi=None, snapshot=None):
     ident = hashlib.md5((subject + body).encode()).hexdigest()[:8]  # reset widgets when settings change
-    tab_fmt, tab_edit = st.tabs(["🎨 Formatted mail", "✏️ Edit text"])
+    tab_fmt, tab_edit = st.tabs(["📧 Mail preview", "✏️ Edit text"])
     with tab_edit:
         subj = st.text_input("Subject", subject, key=f"subj_{key}_{ident}")
-        text = st.text_area("Mail text (edits update the formatted mail)", body, height=520, key=f"body_{key}_{ident}")
-    html_body = to_html(text, subj, kpi)
+        text = st.text_area("Mail text (edits update the preview)", body, height=520, key=f"body_{key}_{ident}")
+    html_body = to_html(text, kpi, snapshot)
+    sender = f"{cfg['sender']} <{cfg['email']}>" if cfg["sender"] and cfg["email"] else (cfg["email"] or cfg["sender"])
+    attach = re.search(r"^Attachment: (.*)$", text, re.M)
     with tab_fmt:
-        st.caption("Subject")
-        st.code(subj, language=None, wrap_lines=True)
-        preview_component(html_body)
+        preview_component(html_body, subj, cfg["to"], cfg["cc"], sender, attach.group(1) if attach else "")
         c1, c2, c3 = st.columns(3)
         safe = re.sub(r"[^A-Za-z0-9_-]+", "_", key)
-        c1.download_button("⬇️ Download .eml (formatted, opens in Outlook)", make_eml(subj, text, html_body),
+        c1.download_button("⬇️ Download .eml (open in Outlook)", make_eml(subj, text, html_body, cfg["to"], cfg["cc"], sender),
                            f"{safe}.eml", "message/rfc822", use_container_width=True, key=f"eml_{key}_{ident}")
-        c2.download_button("⬇️ Download .html", f'<html><head><meta charset="utf-8"></head><body>{html_body}</body></html>', f"{safe}.html",
-                           "text/html", use_container_width=True, key=f"html_{key}_{ident}")
+        c2.download_button("⬇️ Download .html", f'<html><head><meta charset="utf-8"></head><body>{html_body}</body></html>',
+                           f"{safe}.html", "text/html", use_container_width=True, key=f"html_{key}_{ident}")
         c3.download_button("⬇️ Download plain .txt", f"Subject: {subj}\n\n{text}", f"{safe}.txt",
                            use_container_width=True, key=f"txt_{key}_{ident}")
 
@@ -548,6 +582,8 @@ def main():
         company = st.text_input("Your company", "Denave India")
         program = st.text_input("Program name", "Canon CPP")
         recipient = st.text_input("Recipient name (client mail)", "")
+        to = st.text_input("To (email addresses)", "")
+        cc = st.text_input("Cc (email addresses)", "")
         next_month = st.text_input("Next month label", "October")
         st.subheader("Signature")
         sender = st.text_input("Your name", "")
@@ -560,7 +596,7 @@ def main():
             deadline = st.text_input("Recovery-plan deadline", "")
             review_call = st.text_input("Review call date/time", "")
 
-    cfg = dict(audience=audience, company=company, program=program, recipient=recipient, next_month=next_month,
+    cfg = dict(to=to, cc=cc, audience=audience, company=company, program=program, recipient=recipient, next_month=next_month,
                sender=sender, designation=designation, phone=phone, email=email, deadline=deadline, review_call=review_call)
 
     files = st.file_uploader("Upload dashboard HTML file(s)", type=["html", "htm"], accept_multiple_files=True)
@@ -594,7 +630,7 @@ def main():
     for tab, s in zip(tabs, ordered):
         with tab:
             kpi_row(s)
-            render_mail_block(f"{s['region']}_{audience[:3]}", subject_for(s, cfg), build_mail(s, cfg), kpi=s)
+            render_mail_block(f"{s['region']}_{audience[:3]}", subject_for(s, cfg), build_mail(s, cfg), cfg, kpi=s)
 
     if len(ordered) > 1:
         with tabs[-1]:
@@ -606,7 +642,7 @@ def main():
             period = ordered[0]["period"]
             subj = (f"{short(cfg)} × {cfg['program']} | All Regions – {period} Performance: {pct(tot_a / tot_t * 100)} Target Achievement"
                     if audience.startswith("Client") else f"{period} Results – All Regions at {pct(tot_a / tot_t * 100)} of Target")
-            render_mail_block(f"All_{audience[:3]}", subj, combined_mail(ordered, cfg), kpi=tot)
+            render_mail_block(f"All_{audience[:3]}", subj, combined_mail(ordered, cfg), cfg, kpi=tot, snapshot=sorted(ordered, key=lambda x: x['ach_pct'], reverse=True))
 
     st.caption("Numbers come straight from the uploaded dashboards. Please review the mail and add your own context before sending.")
 
