@@ -53,7 +53,7 @@ st.set_page_config(
 
 try:
 
-    GITHUB_TOKEN = st.secrets["GITHUB_TOKEN"]
+    GITHUB_TOKEN = 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
 
 except Exception:
 
