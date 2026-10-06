@@ -20,7 +20,7 @@ GITHUB_REPO = "bipinp8422/Dashboard-Creater"   # username/repo
 BASE_BRANCH = "main"        # branch where app.py is deployed
 PAGES_BRANCH = "gh-pages"   # branch where HTML files are saved
 FOLDER = "reports"          # sub-folder inside the Pages branch ("" for root)
-APP_PASSWORD = "change-me"  # "" to disable the password
+APP_PASSWORD = ""  # "" to disable the password
 # ================================================================
 
 st.set_page_config(page_title="HTML to Link", page_icon="🔗")
