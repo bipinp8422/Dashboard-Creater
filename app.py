@@ -15,7 +15,7 @@ import requests
 import streamlit as st
 
 # =====================  CONFIG - EDIT HERE  =====================
-GITHUB_TOKEN = "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"
+GITHUB_TOKEN = "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"
 GITHUB_REPO = "bipinp8422/Dashboard-Creater"   # username/repo
 BASE_BRANCH = "main"        # branch where app.py is deployed
 PAGES_BRANCH = "gh-pages"   # branch where HTML files are saved
