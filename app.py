@@ -53,7 +53,7 @@ st.set_page_config(
 
 try:
 
-    GITHUB_TOKEN = "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"
+    GITHUB_TOKEN = "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"
 
 except Exception:
 
